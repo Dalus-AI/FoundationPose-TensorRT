@@ -75,7 +75,7 @@ cfg = FoundationPoseWrapperConfig(
     downsample_width=None,   # Set e.g. to 256 for faster inference at lower accuracy
     est_refine_iter=5,       # Refinement iterations for initial pose estimation
     track_refine_iter=2,     # Refinement iterations for tracking
-    chunk_size=84,          # Must match the `chunk_size` of the compiled TensorRT engine
+    chunk_size=252,          # Must match the `chunk_size` of the compiled TensorRT engine
 )
 wrapper = FoundationPoseWrapper(cfg=cfg)
 
