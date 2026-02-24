@@ -12,7 +12,7 @@ pip install "$TENSORRT_HOME/python/tensorrt_lean-10.9.0.34-cp310-none-linux_x86_
 pip install "$TENSORRT_HOME/python/tensorrt_dispatch-10.9.0.34-cp310-none-linux_x86_64.whl"
 deactivate_deps
 
-pip install .e $SCRIPT_DIR/..
+pip install -e $SCRIPT_DIR/..
 
 pip uninstall numpy -y
 pip install "numpy<2"
