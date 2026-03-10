@@ -1,0 +1,31 @@
+# Local dependency installs — these are built fresh inside the container
+deps/
+
+# Compiled TRT engines — bind-mounted at runtime
+weights/tensorrt/
+
+# Runtime outputs
+results/
+
+# Data — bind-mounted at runtime
+demo_data/
+
+# Python artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+**/*.egg-info/
+.eggs/
+dist/
+build/
+
+# Docker files themselves
+docker/
+
+# Editor / OS noise
+.git/
+.gitignore
+*.swp
+.DS_Store

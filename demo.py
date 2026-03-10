@@ -136,7 +136,35 @@ class YcbineoatReader:
         return mesh
 
 
+def _gpu_monitor_worker(gpu_util_samples, gpu_mem_samples, stop_event, interval=0.5):
+    import subprocess
+    while not stop_event.is_set():
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                 "--format=csv,noheader,nounits"],
+                text=True,
+            ).strip().splitlines()[0]
+            util, mem = out.split(",")
+            gpu_util_samples.append(float(util.strip()))
+            gpu_mem_samples.append(float(mem.strip()))
+        except Exception:
+            pass
+        stop_event.wait(interval)
+
+
 if __name__ == "__main__":
+    import threading
+    gpu_util_samples = []
+    gpu_mem_samples = []
+    _stop_event = threading.Event()
+    _monitor_thread = threading.Thread(
+        target=_gpu_monitor_worker,
+        args=(gpu_util_samples, gpu_mem_samples, _stop_event),
+        daemon=True,
+    )
+    _monitor_thread.start()
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     test_scene_dir = os.path.join(script_dir, "demo_data", "mustard0")
 
@@ -166,10 +194,10 @@ if __name__ == "__main__":
 
     # Initialize wrapper
     cfg = FoundationPoseWrapperConfig(
-        downsample_width=None,  # Probably leave None for best accuracy, or set to, e.g., 256 for faster prediction
-        est_refine_iter=5,  # Increase if the initial pose is not good enough
-        track_refine_iter=2,  # Increase if the tracking is not good enough
-        chunk_size=252,  # Specify which chunk size to use for the TensorRT engines (must match the value used in convert_onnx.sh when generating the engines
+        downsample_width=256,  # Probably leave None for best accuracy, or set to, e.g., 256 for faster prediction
+        est_refine_iter=0,  # Increase if the initial pose is not good enough
+        track_refine_iter=1,  # Increase if the tracking is not good enough
+        chunk_size=32,  # Specify which chunk size to use for the TensorRT engines (must match the value used in convert_onnx.sh when generating the engines
     )
     fp_wrapper = FoundationPoseWrapper(cfg=cfg)
 
@@ -219,8 +247,12 @@ if __name__ == "__main__":
         print(f"Frame {i}, estimated poses: {poses}")
 
         res = fp_wrapper.render_results()
-        cv2.imshow("rendered", res)
-        cv2.waitKey(1)
+        cv2.imwrite(f"results/rendered_{i}.png", res)
+        # cv2.imshow("rendered", res)
+        # cv2.waitKey(1)
+
+    _stop_event.set()
+    _monitor_thread.join()
 
     if estimation_times:
         mean_estimation_time = sum(estimation_times) / len(estimation_times)
@@ -229,3 +261,8 @@ if __name__ == "__main__":
     if step_scene_times:
         mean_step_scene_time = sum(step_scene_times) / len(step_scene_times)
         print(f"Mean time for step_scene: {mean_step_scene_time * 1000:.2f} ms")
+
+    if gpu_util_samples:
+        print(f"GPU utilization  — avg: {sum(gpu_util_samples)/len(gpu_util_samples):.1f}%  max: {max(gpu_util_samples):.1f}%")
+    if gpu_mem_samples:
+        print(f"GPU memory (MiB) — avg: {sum(gpu_mem_samples)/len(gpu_mem_samples):.0f}  max: {max(gpu_mem_samples):.0f}")
