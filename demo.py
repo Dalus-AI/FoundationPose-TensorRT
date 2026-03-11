@@ -506,7 +506,7 @@ def main():
                 cv2.imwrite(str(rgb_path), color_bgr)
                 cv2.imwrite(str(depth_path), depth_raw)
 
-            if frame_idx % 1 == 0:
+            if changed_count > 0:
                 print(
                     f"[timing] frame={frame_idx} changed={changed_count} seg_ms={seg_ms:.1f} reg_ms={reg_ms:.1f} total_ms={total_ms:.1f} fps={fps:.1f} det={len(instances)} tracked={len(tracked_object_names)}",
                     flush=True,

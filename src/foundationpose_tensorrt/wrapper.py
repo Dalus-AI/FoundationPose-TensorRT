@@ -58,6 +58,7 @@ class FoundationPoseWrapper:
         self.color = None
         self.depth = None
         self._camera_intrinsics_downsampled = None
+        self._preprocess_cache_key = None
 
     @staticmethod
     def _to_pose_np(pose) -> np.ndarray:
@@ -88,6 +89,44 @@ class FoundationPoseWrapper:
             target_width=self.cfg.downsample_width,
         )
 
+    @staticmethod
+    def _make_preprocess_key(
+        mesh: trimesh.Trimesh,
+        intrinsics: np.ndarray,
+        min_n_views: int = 40,
+        inplane_step: int = 60,
+    ):
+        intrinsics_f32 = np.asarray(intrinsics, dtype=np.float32).reshape(3, 3)
+        return (
+            id(mesh),
+            int(min_n_views),
+            int(inplane_step),
+            intrinsics_f32.tobytes(),
+        )
+
+    def _ensure_preprocessed(
+        self,
+        mesh: trimesh.Trimesh,
+        intrinsics: np.ndarray,
+        min_n_views: int = 40,
+        inplane_step: int = 60,
+    ):
+        key = self._make_preprocess_key(
+            mesh=mesh,
+            intrinsics=intrinsics,
+            min_n_views=min_n_views,
+            inplane_step=inplane_step,
+        )
+        if self._preprocess_cache_key == key:
+            return
+        self._shared_est.preprocess(
+            mesh=mesh,
+            intrinsics=intrinsics,
+            min_n_views=min_n_views,
+            inplane_step=inplane_step,
+        )
+        self._preprocess_cache_key = key
+
     def reset_scene(self, color: np.ndarray, depth: np.ndarray):
         """Resets the wrapper to a new scene. Call this on the initial image."""
 
@@ -108,7 +147,7 @@ class FoundationPoseWrapper:
             mask = downsample_image_to_width(
                 mask.astype(np.uint8), self.cfg.downsample_width
             ).astype(bool)
-        self._shared_est.preprocess(mesh=mesh, intrinsics=self._camera_intrinsics_downsampled)
+        self._ensure_preprocessed(mesh=mesh, intrinsics=self._camera_intrinsics_downsampled)
         pose, tracking_pose = self._shared_est.register(
             rgb=self.color,
             depth=self.depth,
@@ -136,7 +175,7 @@ class FoundationPoseWrapper:
                 mask.astype(np.uint8), self.cfg.downsample_width
             ).astype(bool)
             obj["mask"] = mask
-        self._shared_est.preprocess(
+        self._ensure_preprocessed(
             mesh=obj["mesh"],
             intrinsics=self._camera_intrinsics_downsampled,
         )
@@ -160,7 +199,7 @@ class FoundationPoseWrapper:
         self._downsample(color, depth)
 
         for name, obj in self.objects.items():
-            self._shared_est.preprocess(
+            self._ensure_preprocessed(
                 mesh=obj["mesh"],
                 intrinsics=self._camera_intrinsics_downsampled,
             )
@@ -210,7 +249,7 @@ class FoundationPoseWrapper:
 
         vis = self.color.copy()
         for _, obj in self.objects.items():
-            self._shared_est.preprocess(
+            self._ensure_preprocessed(
                 mesh=obj["mesh"],
                 intrinsics=self._camera_intrinsics_downsampled,
             )
