@@ -94,10 +94,16 @@ class FoundationPoseWrapper:
         self._downsample(color, depth)
         self.objects = {}
 
+    def set_frame(self, color: np.ndarray, depth: np.ndarray):
+        """Update current frame buffers without resetting tracked objects."""
+        self._downsample(color, depth)
+
     def add_object(self, name: str, mesh: trimesh.Trimesh, mask: np.ndarray):
         """Adds an object to the scene. Call this sequentially for each object in the scene.
         Will trigger initial detection step.
         """
+        if self.color is None or self.depth is None:
+            raise RuntimeError("Frame buffers are empty. Call reset_scene() or set_frame() before add_object().")
         if mask.shape[0:2] != self.color.shape[0:2]:
             mask = downsample_image_to_width(
                 mask.astype(np.uint8), self.cfg.downsample_width
@@ -121,7 +127,15 @@ class FoundationPoseWrapper:
 
     def register_object(self, name: str):
         """Manually trigger detection step."""
+        if self.color is None or self.depth is None:
+            raise RuntimeError("Frame buffers are empty. Call reset_scene() or set_frame() before register_object().")
         obj = self.objects[name]
+        mask = np.asarray(obj["mask"], dtype=np.uint8)
+        if mask.shape[0:2] != self.color.shape[0:2]:
+            mask = downsample_image_to_width(
+                mask.astype(np.uint8), self.cfg.downsample_width
+            ).astype(bool)
+            obj["mask"] = mask
         self._shared_est.preprocess(
             mesh=obj["mesh"],
             intrinsics=self._camera_intrinsics_downsampled,

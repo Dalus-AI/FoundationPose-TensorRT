@@ -417,7 +417,7 @@ def main():
             instances, labels, conf = collect_instances(detections, masks, class_map, label_filter=label_filter)
             cur_instances = summarize_instances(instances, depth_raw.astype(np.float32))
             if prev_instances:
-                instance_update_status, _ = compute_instance_update_status(
+                instance_update_status, cur_to_prev = compute_instance_update_status(
                     cur_instances,
                     prev_instances,
                     center_displacement_threshold_px=float(args.center_thresh_px),
@@ -427,23 +427,54 @@ def main():
                 )
                 changed_count = sum(1 for v in instance_update_status.values() if v == "updated")
             else:
+                instance_update_status = {int(c["cur_list_idx"]): "updated" for c in cur_instances}
+                cur_to_prev = {}
                 changed_count = len(cur_instances)
 
             reg_ms = 0.0
-            if not initialized and instances:
-                print(f"[demo] initialized FoundationPose for {len(instances)} instance(s)", flush=True)
-
             render = color_bgr
             reg_t0 = time.perf_counter()
-            fp_wrapper.reset_scene(color_rgb, depth_m)
-            tracked_object_names = []
-            for i, inst in enumerate(instances):
-                obj_name = f"{inst['label']}_{i}"
-                fp_wrapper.add_object(obj_name, mesh, np.asarray(inst["mask"], dtype=bool))
-                tracked_object_names.append(obj_name)
+            fp_wrapper.set_frame(color_rgb, depth_m)
+            prev_idx_to_track = {
+                int(p["cur_list_idx"]): str(p["track_name"])
+                for p in prev_instances
+                if "track_name" in p
+            }
+            active_track_names = set()
+            next_prev_instances = []
+
+            for cur in cur_instances:
+                cur_idx = int(cur["cur_list_idx"])
+                inst = instances[cur_idx]
+                track_name = None
+                if cur_idx in cur_to_prev:
+                    prev_idx = int(cur_to_prev[cur_idx])
+                    track_name = prev_idx_to_track.get(prev_idx)
+
+                if track_name and track_name in fp_wrapper.objects:
+                    if instance_update_status.get(cur_idx, "updated") == "updated":
+                        fp_wrapper.objects[track_name]["mask"] = np.asarray(inst["mask"], dtype=bool)
+                        fp_wrapper.register_object(track_name)
+                    # not_updated: keep previous pose as-is
+                    cur["track_name"] = track_name
+                else:
+                    track_name = f"{inst['label']}_{frame_idx}_{cur_idx}"
+                    fp_wrapper.add_object(track_name, mesh, np.asarray(inst["mask"], dtype=bool))
+                    cur["track_name"] = track_name
+
+                active_track_names.add(track_name)
+                next_prev_instances.append(cur)
+
+            stale = [name for name in list(fp_wrapper.objects.keys()) if name not in active_track_names]
+            for name in stale:
+                del fp_wrapper.objects[name]
+
+            tracked_object_names = sorted(list(fp_wrapper.objects.keys()))
+            prev_instances = next_prev_instances
             reg_ms = (time.perf_counter() - reg_t0) * 1000.0
             initialized = len(tracked_object_names) > 0
-            prev_instances = cur_instances
+            if frame_idx == 0 and initialized:
+                print(f"[demo] initialized FoundationPose for {len(tracked_object_names)} instance(s)", flush=True)
 
             if initialized:
                 render_raw = fp_wrapper.render_results()
