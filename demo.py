@@ -415,82 +415,37 @@ def main():
             h, w = color_bgr.shape[:2]
             masks = detections_masks_to_numpy(detections, h, w)
             instances, labels, conf = collect_instances(detections, masks, class_map, label_filter=label_filter)
+            cur_instances = summarize_instances(instances, depth_raw.astype(np.float32))
+            if prev_instances:
+                instance_update_status, _ = compute_instance_update_status(
+                    cur_instances,
+                    prev_instances,
+                    center_displacement_threshold_px=float(args.center_thresh_px),
+                    depth_change_threshold_mm=float(args.depth_thresh_mm),
+                    min_iou_to_match=float(args.iou_thresh),
+                    max_match_center_distance_px=float(args.match_max_center_px),
+                )
+                changed_count = sum(1 for v in instance_update_status.values() if v == "updated")
+            else:
+                changed_count = len(cur_instances)
 
-            track_ms = 0.0
             reg_ms = 0.0
-            n_updated = 0
-            n_not_updated = 0
             if not initialized and instances:
-                fp_wrapper.reset_scene(color_rgb, depth_m)
-                tracked_object_names = []
-                for i, inst in enumerate(instances):
-                    obj_name = f"{inst['label']}_{i}"
-                    fp_wrapper.add_object(obj_name, mesh, inst["mask"].astype(bool))
-                    tracked_object_names.append(obj_name)
-                initialized = len(tracked_object_names) > 0
-                if initialized:
-                    print(f"[demo] initialized FoundationPose for {len(tracked_object_names)} instance(s)", flush=True)
-                    prev_instances = summarize_instances(instances, depth_raw.astype(np.float32))
-                    for s in prev_instances:
-                        idx = int(s["cur_list_idx"])
-                        if idx < len(tracked_object_names):
-                            s["track_name"] = tracked_object_names[idx]
+                print(f"[demo] initialized FoundationPose for {len(instances)} instance(s)", flush=True)
 
             render = color_bgr
+            reg_t0 = time.perf_counter()
+            fp_wrapper.reset_scene(color_rgb, depth_m)
+            tracked_object_names = []
+            for i, inst in enumerate(instances):
+                obj_name = f"{inst['label']}_{i}"
+                fp_wrapper.add_object(obj_name, mesh, np.asarray(inst["mask"], dtype=bool))
+                tracked_object_names.append(obj_name)
+            reg_ms = (time.perf_counter() - reg_t0) * 1000.0
+            initialized = len(tracked_object_names) > 0
+            prev_instances = cur_instances
+
             if initialized:
-                track_t0 = time.perf_counter()
-                _ = fp_wrapper.step_scene(color_rgb, depth_m)
-                track_ms = (time.perf_counter() - track_t0) * 1000.0
-
-                if instances:
-                    cur_instances = summarize_instances(instances, depth_raw.astype(np.float32))
-                    instance_update_status, cur_to_prev = compute_instance_update_status(
-                        cur_instances,
-                        prev_instances,
-                        center_displacement_threshold_px=float(args.center_thresh_px),
-                        depth_change_threshold_mm=float(args.depth_thresh_mm),
-                        min_iou_to_match=float(args.iou_thresh),
-                        max_match_center_distance_px=float(args.match_max_center_px),
-                    )
-                    n_updated = sum(1 for v in instance_update_status.values() if v == "updated")
-                    n_not_updated = sum(1 for v in instance_update_status.values() if v == "not_updated")
-
-                    prev_idx_to_track = {
-                        int(p["cur_list_idx"]): str(p["track_name"])
-                        for p in prev_instances
-                        if "track_name" in p
-                    }
-                    active_track_names = set()
-                    next_prev_instances = []
-
-                    reg_t0 = time.perf_counter()
-                    for cur in cur_instances:
-                        cur_idx = int(cur["cur_list_idx"])
-                        inst = instances[cur_idx]
-                        track_name = None
-                        if cur_idx in cur_to_prev:
-                            prev_idx = int(cur_to_prev[cur_idx])
-                            track_name = prev_idx_to_track.get(prev_idx)
-
-                        if track_name and track_name in fp_wrapper.objects:
-                            if instance_update_status.get(cur_idx, "updated") == "updated":
-                                fp_wrapper.objects[track_name]["mask"] = np.asarray(inst["mask"], dtype=bool)
-                                fp_wrapper.register_object(track_name)
-                            cur["track_name"] = track_name
-                        else:
-                            track_name = f"{inst['label']}_{frame_idx}_{cur_idx}"
-                            fp_wrapper.add_object(track_name, mesh, np.asarray(inst["mask"], dtype=bool))
-                            cur["track_name"] = track_name
-                        active_track_names.add(track_name)
-                        next_prev_instances.append(cur)
-                    reg_ms = (time.perf_counter() - reg_t0) * 1000.0
-
-                    stale = [name for name in list(fp_wrapper.objects.keys()) if name not in active_track_names]
-                    for name in stale:
-                        del fp_wrapper.objects[name]
-                    tracked_object_names = sorted(list(fp_wrapper.objects.keys()))
-                    prev_instances = next_prev_instances
-
                 render_raw = fp_wrapper.render_results()
                 render = to_uint8(render_raw)
                 if render.ndim == 3 and render.shape[2] == 3:
@@ -501,16 +456,6 @@ def main():
             fps = (1000.0 / total_ms) if total_ms > 0 else 0.0
             status = f"FPS:{fps:.1f}  det:{len(instances)}  tracked:{len(tracked_object_names)}"
             cv2.putText(seg_overlay, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(
-                seg_overlay,
-                f"updated:{n_updated} not_updated:{n_not_updated}",
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
 
             render_path = results_dir / f"rendered.png"
             seg_path = results_dir / f"segmentation.png"
@@ -524,7 +469,7 @@ def main():
 
             if frame_idx % 1 == 0:
                 print(
-                    f"[timing] frame={frame_idx} seg_ms={seg_ms:.1f} track_ms={track_ms:.1f} reg_ms={reg_ms:.1f} total_ms={total_ms:.1f} fps={fps:.1f} det={len(instances)} tracked={len(tracked_object_names)} updated={n_updated} not_updated={n_not_updated}",
+                    f"[timing] frame={frame_idx} changed={changed_count} seg_ms={seg_ms:.1f} reg_ms={reg_ms:.1f} total_ms={total_ms:.1f} fps={fps:.1f} det={len(instances)} tracked={len(tracked_object_names)}",
                     flush=True,
                 )
 
@@ -537,7 +482,6 @@ def main():
                         break
                     if key == ord("r"):
                         initialized = False
-                        prev_instances = []
                         print("[demo] tracking reset requested", flush=True)
                 except cv2.error as exc:
                     print(f"[demo] HighGUI failed, disabling windows: {exc}", flush=True)
