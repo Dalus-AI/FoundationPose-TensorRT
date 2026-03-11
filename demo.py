@@ -321,6 +321,7 @@ def parse_args():
     parser.add_argument("--depth-thresh-mm", type=float, default=float(os.environ.get("INSTANCE_DEPTH_THRESH_MM", "5.0")), help="mean depth change threshold")
     parser.add_argument("--iou-thresh", type=float, default=float(os.environ.get("INSTANCE_IOU_THRESH", "0.05")), help="IoU threshold for instance matching")
     parser.add_argument("--match-max-center-px", type=float, default=float(os.environ.get("INSTANCE_MATCH_MAX_CENTER_PX", "120.0")), help="max center distance allowed for current->prev mapping")
+    parser.add_argument("--debug", type=int, default=int(os.environ.get("DEMO_DEBUG", "0")), help="1 enables plotting/saving/windows, 0 disables visual output")
     return parser.parse_args()
 
 
@@ -330,9 +331,12 @@ def main():
     print("[demo] started", flush=True)
 
     script_dir = Path(__file__).resolve().parent
-    results_dir = Path(os.environ.get("FRAME_OUTPUT_DIR", str(script_dir / "demo_data" / "mustard0" / "results")))
-    results_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[demo] Writing rendered frames to: {results_dir}", flush=True)
+    debug_mode = int(args.debug) == 1
+    results_dir = None
+    if debug_mode:
+        results_dir = Path(os.environ.get("FRAME_OUTPUT_DIR", str(script_dir / "demo_data" / "mustard0" / "results")))
+        results_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[demo] Writing rendered frames to: {results_dir}", flush=True)
 
     remy_perception_dir = Path(os.environ.get("REMY_PERCEPTION_DIR", "/workspace/remy-pose-estimation/src/perception"))
     default_mesh = remy_perception_dir / "mesh" / "switch_obj_scaled" / "switch_scaled.obj"
@@ -366,7 +370,7 @@ def main():
 
     print(f"[demo] depth_scale={depth_scale}", flush=True)
 
-    show_viz = os.environ.get("FP_SHOW_VIZ", "0") == "1"
+    show_viz = debug_mode and (os.environ.get("FP_SHOW_VIZ", "0") == "1")
     ui_available = False
     if show_viz:
         try:
@@ -476,27 +480,31 @@ def main():
             if frame_idx == 0 and initialized:
                 print(f"[demo] initialized FoundationPose for {len(tracked_object_names)} instance(s)", flush=True)
 
-            if initialized:
+            if initialized and debug_mode:
                 render_raw = fp_wrapper.render_results()
                 render = to_uint8(render_raw)
                 if render.ndim == 3 and render.shape[2] == 3:
                     render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
 
-            seg_overlay = draw_seg_overlay(color_bgr, masks, labels, conf)
+            seg_overlay = None
+            if debug_mode:
+                seg_overlay = draw_seg_overlay(color_bgr, masks, labels, conf)
+
             total_ms = (time.perf_counter() - frame_t0) * 1000.0
             fps = (1000.0 / total_ms) if total_ms > 0 else 0.0
-            status = f"FPS:{fps:.1f}  det:{len(instances)}  tracked:{len(tracked_object_names)}"
-            cv2.putText(seg_overlay, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            if debug_mode and seg_overlay is not None:
+                status = f"FPS:{fps:.1f}  det:{len(instances)}  tracked:{len(tracked_object_names)}"
+                cv2.putText(seg_overlay, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-            render_path = results_dir / f"rendered.png"
-            seg_path = results_dir / f"segmentation.png"
-            rgb_path = results_dir / f"rgb.png"
-            depth_path = results_dir / f"depth.png"
-
-            cv2.imwrite(str(render_path), render)
-            cv2.imwrite(str(seg_path), seg_overlay)
-            cv2.imwrite(str(rgb_path), color_bgr)
-            cv2.imwrite(str(depth_path), depth_raw)
+            if debug_mode:
+                render_path = results_dir / f"rendered.png"
+                seg_path = results_dir / f"segmentation.png"
+                rgb_path = results_dir / f"rgb.png"
+                depth_path = results_dir / f"depth.png"
+                cv2.imwrite(str(render_path), render)
+                cv2.imwrite(str(seg_path), seg_overlay)
+                cv2.imwrite(str(rgb_path), color_bgr)
+                cv2.imwrite(str(depth_path), depth_raw)
 
             if frame_idx % 1 == 0:
                 print(
@@ -504,7 +512,7 @@ def main():
                     flush=True,
                 )
 
-            if ui_available:
+            if ui_available and debug_mode and seg_overlay is not None:
                 try:
                     cv2.imshow("segmentation", seg_overlay)
                     cv2.imshow("foundationpose", render)

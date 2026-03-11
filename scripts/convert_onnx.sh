@@ -7,10 +7,12 @@ if ! command -v trtexec &> /dev/null; then
     activate_deps
 fi
 
-# Set the desired maximum batch size. A smaller number (e.g., 16, 32, ...) results in lower VRAM usage.
-# However, the detection step might be faulty if the batch size becomes too small. Probably due to batch normalization layers or so?
-# Original FoundationPose uses 252.
-chunk_size=32
+# Set TensorRT max batch size to match the number of pose hypotheses used during
+# registration: min_n_views * (360 / inplane_step). This avoids chunking and
+# keeps registration inference in a single engine call.
+min_n_views=40
+inplane_step=60
+chunk_size=$((min_n_views * 360 / inplane_step))
 
 MODEL_FOLDER_PATH="$SCRIPT_DIR/../weights"
 ONNX_DIR="${MODEL_FOLDER_PATH}/onnx"
