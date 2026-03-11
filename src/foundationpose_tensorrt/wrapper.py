@@ -4,8 +4,9 @@ import numpy as np
 from pathlib import Path
 import cv2
 import trimesh
+import torch
 
-from foundationpose_tensorrt import FoundationposeModel
+from foundationpose_tensorrt.model import FoundationposeModel
 
 
 @dataclass
@@ -52,12 +53,21 @@ class FoundationPoseWrapper:
         self.cfg = cfg
         self.camera_intrinsics = camera_intrinsics
 
-        self.est = {}
-        self.poses = {}
+        self._shared_est = FoundationposeModel(chunk_size=self.cfg.chunk_size)
+        self.objects = {}
         self.color = None
         self.depth = None
-        self.masks = {}
         self._camera_intrinsics_downsampled = None
+
+    @staticmethod
+    def _to_pose_np(pose) -> np.ndarray:
+        if hasattr(pose, "detach"):
+            pose = pose.detach()
+        if hasattr(pose, "cpu"):
+            pose = pose.cpu()
+        if hasattr(pose, "numpy"):
+            pose = pose.numpy()
+        return np.asarray(pose, dtype=np.float32).reshape(4, 4)
 
     def set_camera_intrinsics(self, camera_intrinsics: np.ndarray):
         """Sets the camera intrinsics. Call this before resetting the scene."""
@@ -82,46 +92,51 @@ class FoundationPoseWrapper:
         """Resets the wrapper to a new scene. Call this on the initial image."""
 
         self._downsample(color, depth)
-
-        for _, v in self.est.items():
-            del v
-        self.est: Dict[str, FoundationposeModel] = {}
-        self.poses = {}
-        self.masks = {}
+        self.objects = {}
 
     def add_object(self, name: str, mesh: trimesh.Trimesh, mask: np.ndarray):
         """Adds an object to the scene. Call this sequentially for each object in the scene.
         Will trigger initial detection step.
         """
-
-        est = FoundationposeModel(chunk_size=self.cfg.chunk_size)
-        self.est[name] = est
-
         if mask.shape[0:2] != self.color.shape[0:2]:
             mask = downsample_image_to_width(
                 mask.astype(np.uint8), self.cfg.downsample_width
             ).astype(bool)
-        self.masks[name] = mask
-
-        est.preprocess(mesh=mesh, intrinsics=self._camera_intrinsics_downsampled)
-
-        pose = est.process(
-            [self.color, self.depth], 0, mask=mask, iterations=self.cfg.est_refine_iter
+        self._shared_est.preprocess(mesh=mesh, intrinsics=self._camera_intrinsics_downsampled)
+        pose, tracking_pose = self._shared_est.register(
+            rgb=self.color,
+            depth=self.depth,
+            ob_mask=mask,
+            mesh=self._shared_est.mesh,
+            iteration=self.cfg.est_refine_iter,
         )
-
-        self.poses[name] = pose
-        return pose.cpu().numpy()
+        pose_np = self._to_pose_np(pose)
+        self.objects[name] = {
+            "mesh": mesh,
+            "mask": mask,
+            "pose": pose_np,
+            "tracking_pose": tracking_pose,
+        }
+        return pose_np
 
     def register_object(self, name: str):
         """Manually trigger detection step."""
-        pose = self.est[name].process(
-            [self.color, self.depth],
-            0,
-            mask=self.masks[name],
-            iterations=self.cfg.est_refine_iter,
+        obj = self.objects[name]
+        self._shared_est.preprocess(
+            mesh=obj["mesh"],
+            intrinsics=self._camera_intrinsics_downsampled,
         )
-        self.poses[name] = pose
-        return pose.cpu().numpy()
+        pose, tracking_pose = self._shared_est.register(
+            rgb=self.color,
+            depth=self.depth,
+            ob_mask=obj["mask"],
+            mesh=self._shared_est.mesh,
+            iteration=self.cfg.est_refine_iter,
+        )
+        pose_np = self._to_pose_np(pose)
+        obj["pose"] = pose_np
+        obj["tracking_pose"] = tracking_pose
+        return pose_np
 
     def step_scene(self, color: np.ndarray, depth: np.ndarray):
         """Steps the wrapper to the next frame. Call this on subsequent images.
@@ -130,17 +145,25 @@ class FoundationPoseWrapper:
 
         self._downsample(color, depth)
 
-        for name, est in self.est.items():
-            pose = est.process(
-                [self.color, self.depth], 1, iterations=self.cfg.track_refine_iter
+        for name, obj in self.objects.items():
+            self._shared_est.preprocess(
+                mesh=obj["mesh"],
+                intrinsics=self._camera_intrinsics_downsampled,
             )
-            self.poses[name] = pose
+            pose, tracking_pose = self._shared_est.track_one(
+                self.color,
+                self.depth,
+                obj["tracking_pose"],
+                iteration=self.cfg.track_refine_iter,
+            )
+            obj["pose"] = self._to_pose_np(pose)
+            obj["tracking_pose"] = tracking_pose
 
-        poses = {k: v.cpu().numpy() for k, v in self.poses.items()}
+        poses = {k: self._to_pose_np(v["pose"]) for k, v in self.objects.items()}
         return poses
 
     def get_poses(self) -> Dict[str, np.ndarray]:
-        return self.poses
+        return {k: self._to_pose_np(v["pose"]) for k, v in self.objects.items()}
 
     @classmethod
     def load_mesh(cls, mesh_path: str):
@@ -172,6 +195,10 @@ class FoundationPoseWrapper:
         """Renders the results of the last frame. Returns the rendered image."""
 
         vis = self.color.copy()
-        for name, pose in self.poses.items():
-            vis = self.est[name].draw_image(vis, pose.cpu().numpy())
+        for _, obj in self.objects.items():
+            self._shared_est.preprocess(
+                mesh=obj["mesh"],
+                intrinsics=self._camera_intrinsics_downsampled,
+            )
+            vis = self._shared_est.draw_image(vis, self._to_pose_np(obj["pose"]))
         return vis[..., ::-1]

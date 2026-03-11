@@ -1,268 +1,559 @@
-import glob
-import logging
+import argparse
+import json
 import os
-from foundationpose_tensorrt import FoundationPoseWrapper, FoundationPoseWrapperConfig
-
 import time
-import numpy as np
+from pathlib import Path
+
 import cv2
-import imageio
-import trimesh
+import numpy as np
+import pyrealsense2 as rs
+from foundationpose_tensorrt import FoundationPoseWrapper, FoundationPoseWrapperConfig
+from rfdetr import RFDETRSegMedium
 
 
-# Taken from https://nvlabs.github.io/FoundationPose/
-def depth2xyzmap(depth, K, uvs=None):
-    invalid_mask = depth < 0.001
-    H, W = depth.shape[:2]
-    if uvs is None:
-        vs, us = np.meshgrid(
-            np.arange(0, H), np.arange(0, W), sparse=False, indexing="ij"
-        )
-        vs = vs.reshape(-1)
-        us = us.reshape(-1)
-    else:
-        uvs = uvs.round().astype(int)
-        us = uvs[:, 0]
-        vs = uvs[:, 1]
-    zs = depth[vs, us]
-    xs = (us - K[0, 2]) * zs / K[0, 0]
-    ys = (vs - K[1, 2]) * zs / K[1, 1]
-    pts = np.stack((xs.reshape(-1), ys.reshape(-1), zs.reshape(-1)), 1)  # (N, 3)
-    xyz_map = np.zeros((H, W, 3), dtype=np.float32)
-    xyz_map[vs, us] = pts
-    xyz_map[invalid_mask] = 0
-    return xyz_map
+DEFAULT_CLASS_MAP = {
+    0: "relay",
+    1: "switch",
+    2: "switch",
+}
 
 
-# Taken from https://nvlabs.github.io/FoundationPose/
-class YcbineoatReader:
-    def __init__(self, video_dir, downscale=1, shorter_side=None, zfar=np.inf):
-        self.video_dir = video_dir
-        self.downscale = downscale
-        self.zfar = zfar
-        self.color_files = sorted(glob.glob(f"{self.video_dir}/rgb/*.png"))
-        self.K = np.loadtxt(f"{video_dir}/cam_K.txt").reshape(3, 3)
-        self.id_strs = []
-        for color_file in self.color_files:
-            id_str = os.path.basename(color_file).replace(".png", "")
-            self.id_strs.append(id_str)
-        self.H, self.W = cv2.imread(self.color_files[0]).shape[:2]
+def load_rfdetr_model(checkpoint_path=None, device="cuda"):
+    """Load RF-DETR model with broad constructor compatibility."""
+    base_kwargs = {"device": device}
 
-        if shorter_side is not None:
-            self.downscale = shorter_side / min(self.H, self.W)
-
-        self.H = int(self.H * self.downscale)
-        self.W = int(self.W * self.downscale)
-        self.K[:2] *= self.downscale
-
-        self.gt_pose_files = sorted(glob.glob(f"{self.video_dir}/annotated_poses/*"))
-
-        self.videoname_to_object = {
-            "bleach0": "021_bleach_cleanser",
-            "bleach_hard_00_03_chaitanya": "021_bleach_cleanser",
-            "cracker_box_reorient": "003_cracker_box",
-            "cracker_box_yalehand0": "003_cracker_box",
-            "mustard0": "006_mustard_bottle",
-            "mustard_easy_00_02": "006_mustard_bottle",
-            "sugar_box1": "004_sugar_box",
-            "sugar_box_yalehand0": "004_sugar_box",
-            "tomato_soup_can_yalehand0": "005_tomato_soup_can",
-        }
-
-    def get_video_name(self):
-        return self.video_dir.split("/")[-1]
-
-    def __len__(self):
-        return len(self.color_files)
-
-    def get_gt_pose(self, i):
+    def _try_load(**kwargs):
         try:
-            pose = np.loadtxt(self.gt_pose_files[i]).reshape(4, 4)
-            return pose
-        except:
-            logging.info("GT pose not found, return None")
+            return RFDETRSegMedium(**kwargs)
+        except TypeError:
             return None
 
-    def get_color(self, i):
-        color = imageio.imread(self.color_files[i])[..., :3]
-        color = cv2.resize(color, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        return color
+    def _ensure_device(model):
+        if hasattr(model, "to"):
+            model = model.to(device)
+        return model
 
-    def get_mask(self, i):
-        mask = cv2.imread(self.color_files[i].replace("rgb", "masks"), -1)
-        if len(mask.shape) == 3:
-            for c in range(3):
-                if mask[..., c].sum() > 0:
-                    mask = mask[..., c]
-                    break
-        mask = (
-            cv2.resize(mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-            .astype(bool)
-            .astype(np.uint8)
-        )
-        return mask
+    if not checkpoint_path:
+        model = _try_load(**base_kwargs) or RFDETRSegMedium()
+        return _ensure_device(model)
 
-    def get_depth(self, i):
-        depth = cv2.imread(self.color_files[i].replace("rgb", "depth"), -1) / 1e3
-        depth = cv2.resize(depth, (self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        depth[(depth < 0.001) | (depth >= self.zfar)] = 0
-        return depth
+    attempts = [
+        "pretrain_weights",
+        "checkpoint_path",
+        "checkpoint",
+        "weights",
+        "weights_path",
+        "model_path",
+    ]
+    for arg_name in attempts:
+        model = _try_load(**{**base_kwargs, arg_name: checkpoint_path})
+        if model is None:
+            model = _try_load(**{arg_name: checkpoint_path})
+        if model is not None:
+            return _ensure_device(model)
 
-    def get_xyz_map(self, i):
-        depth = self.get_depth(i)
-        xyz_map = depth2xyzmap(depth, self.K)
-        return xyz_map
-
-    def get_occ_mask(self, i):
-        hand_mask_file = self.color_files[i].replace("rgb", "masks_hand")
-        occ_mask = np.zeros((self.H, self.W), dtype=bool)
-        if os.path.exists(hand_mask_file):
-            occ_mask = occ_mask | (cv2.imread(hand_mask_file, -1) > 0)
-
-        right_hand_mask_file = self.color_files[i].replace("rgb", "masks_hand_right")
-        if os.path.exists(right_hand_mask_file):
-            occ_mask = occ_mask | (cv2.imread(right_hand_mask_file, -1) > 0)
-
-        occ_mask = cv2.resize(
-            occ_mask, (self.W, self.H), interpolation=cv2.INTER_NEAREST
-        )
-
-        return occ_mask.astype(np.uint8)
-
-    def get_gt_mesh(self):
-        ob_name = self.videoname_to_object[self.get_video_name()]
-        YCB_VIDEO_DIR = os.getenv("YCB_VIDEO_DIR")
-        mesh = trimesh.load(f"{YCB_VIDEO_DIR}/models/{ob_name}/textured_simple.obj")
-        return mesh
+    raise RuntimeError(
+        "Could not load checkpoint with RFDETRSegMedium constructor. "
+        "Try a different RF-DETR version or constructor arg name."
+    )
 
 
-def _gpu_monitor_worker(gpu_util_samples, gpu_mem_samples, stop_event, interval=0.5):
-    import subprocess
-    while not stop_event.is_set():
+def intrinsics_matrix_from_color_frame(color_frame):
+    intr = color_frame.profile.as_video_stream_profile().intrinsics
+    return np.array(
+        [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+
+
+def detections_masks_to_numpy(detections, height, width):
+    masks = getattr(detections, "mask", None)
+    if masks is None:
+        return np.zeros((0, height, width), dtype=np.float32)
+    masks_np = np.asarray(masks)
+    if masks_np.ndim == 2:
+        masks_np = masks_np[None, ...]
+    if masks_np.ndim != 3:
+        return np.zeros((0, height, width), dtype=np.float32)
+    if masks_np.shape[1] != height or masks_np.shape[2] != width:
+        resized = []
+        for m in masks_np:
+            resized.append(cv2.resize(m.astype(np.float32), (width, height), interpolation=cv2.INTER_NEAREST))
+        masks_np = np.stack(resized, axis=0)
+    return masks_np.astype(np.float32)
+
+
+def parse_class_map(raw_json: str | None):
+    if not raw_json:
+        return dict(DEFAULT_CLASS_MAP)
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return dict(DEFAULT_CLASS_MAP)
+    if not isinstance(data, dict):
+        return dict(DEFAULT_CLASS_MAP)
+    out = dict(DEFAULT_CLASS_MAP)
+    for k, v in data.items():
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
-                 "--format=csv,noheader,nounits"],
-                text=True,
-            ).strip().splitlines()[0]
-            util, mem = out.split(",")
-            gpu_util_samples.append(float(util.strip()))
-            gpu_mem_samples.append(float(mem.strip()))
-        except Exception:
-            pass
-        stop_event.wait(interval)
+            out[int(k)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def class_id_to_label(class_id: int, class_map: dict[int, str]) -> str:
+    if class_id in class_map:
+        return class_map[class_id]
+    if (class_id + 1) in class_map:
+        return class_map[class_id + 1]
+    return f"class_{class_id}"
+
+
+def collect_instances(detections, masks, class_map, label_filter=None, min_pixels=50):
+    if masks.shape[0] == 0:
+        return [], [], np.zeros((0,), dtype=np.float32)
+
+    class_ids = np.asarray(getattr(detections, "class_id", []), dtype=np.int32).reshape(-1)
+    if class_ids.size == 0:
+        return [], [], np.zeros((0,), dtype=np.float32)
+
+    conf = np.asarray(
+        getattr(detections, "confidence", np.ones_like(class_ids, dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
+    if conf.size != class_ids.size:
+        conf = np.ones_like(class_ids, dtype=np.float32)
+
+    labels = [class_id_to_label(int(cid), class_map) for cid in class_ids.tolist()]
+    n = min(masks.shape[0], len(labels), len(conf))
+    instances = []
+    for i in range(n):
+        label = labels[i]
+        if label_filter is not None and label != label_filter:
+            continue
+        m = masks[i] > 0.5
+        if int(np.count_nonzero(m)) < int(min_pixels):
+            continue
+        instances.append(
+            {
+                "det_idx": i,
+                "label": label,
+                "conf": float(conf[i]),
+                "mask": m,
+            }
+        )
+    return instances, labels[:n], conf[:n]
+
+
+def bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = float((ix2 - ix1) * (iy2 - iy1))
+    area_a = float(max(0.0, (ax2 - ax1) * (ay2 - ay1)))
+    area_b = float(max(0.0, (bx2 - bx1) * (by2 - by1)))
+    union = area_a + area_b - inter
+    return (inter / union) if union > 0 else 0.0
+
+
+def summarize_instances(instances, depth_mm):
+    out = []
+    h, w = depth_mm.shape[:2]
+    for i, inst in enumerate(instances):
+        m = np.asarray(inst["mask"], dtype=np.float32)
+        if m.shape != (h, w):
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        ys, xs = np.where(m > 0.5)
+        if len(xs) == 0:
+            continue
+        x1, y1 = float(xs.min()), float(ys.min())
+        x2, y2 = float(xs.max()), float(ys.max())
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        valid = (m > 0.5) & (depth_mm > 0)
+        mean_depth_mm = float(np.mean(depth_mm[valid])) if np.any(valid) else None
+        out.append(
+            {
+                "cur_list_idx": i,
+                "bbox_xyxy": (x1, y1, x2, y2),
+                "center_xy": (cx, cy),
+                "mean_depth_mm": mean_depth_mm,
+                "label": inst["label"],
+            }
+        )
+    return out
+
+
+def compute_instance_update_status(
+    current_instances,
+    prev_instances,
+    center_displacement_threshold_px=15.0,
+    depth_change_threshold_mm=5.0,
+    min_iou_to_match=0.05,
+    max_match_center_distance_px=120.0,
+):
+    status = {}
+    cur_to_prev = {}
+    # 1) Build one-to-one mapping by closest center distance (label-consistent).
+    pairs = []
+    for cur in current_instances:
+        cur_idx = int(cur["cur_list_idx"])
+        cur_cx, cur_cy = cur["center_xy"]
+        cur_label = cur.get("label")
+        for prev in prev_instances:
+            prev_idx = int(prev["cur_list_idx"])
+            if cur_label != prev.get("label"):
+                continue
+            prev_cx, prev_cy = prev["center_xy"]
+            dist = float(np.sqrt((cur_cx - prev_cx) ** 2 + (cur_cy - prev_cy) ** 2))
+            pairs.append((dist, cur_idx, prev_idx))
+    pairs.sort(key=lambda x: x[0])
+
+    used_cur = set()
+    used_prev = set()
+    for dist, cur_idx, prev_idx in pairs:
+        if cur_idx in used_cur or prev_idx in used_prev:
+            continue
+        if np.isfinite(max_match_center_distance_px) and dist > max_match_center_distance_px:
+            continue
+        cur_to_prev[cur_idx] = prev_idx
+        used_cur.add(cur_idx)
+        used_prev.add(prev_idx)
+
+    prev_by_idx = {int(p["cur_list_idx"]): p for p in prev_instances}
+    cur_by_idx = {int(c["cur_list_idx"]): c for c in current_instances}
+
+    # 2) Determine updated/not_updated from mapped pairs.
+    for cur_idx, cur in cur_by_idx.items():
+        if cur_idx not in cur_to_prev:
+            status[cur_idx] = "updated"
+            continue
+
+        prev_idx = int(cur_to_prev[cur_idx])
+        prev = prev_by_idx.get(prev_idx)
+        if prev is None:
+            status[cur_idx] = "updated"
+            continue
+
+        cur_bbox = cur["bbox_xyxy"]
+        prev_bbox = prev["bbox_xyxy"]
+        iou = bbox_iou(cur_bbox, prev_bbox)
+        cur_cx, cur_cy = cur["center_xy"]
+        prev_cx, prev_cy = prev["center_xy"]
+        disp_2d = float(np.sqrt((cur_cx - prev_cx) ** 2 + (cur_cy - prev_cy) ** 2))
+
+        cur_depth_mm = cur.get("mean_depth_mm")
+        prev_depth_mm = prev.get("mean_depth_mm")
+        depth_changed = False
+        if (
+            cur_depth_mm is not None
+            and prev_depth_mm is not None
+            and np.isfinite(cur_depth_mm)
+            and np.isfinite(prev_depth_mm)
+        ):
+            depth_changed = abs(float(cur_depth_mm) - float(prev_depth_mm)) > depth_change_threshold_mm
+
+        if disp_2d > center_displacement_threshold_px or depth_changed or iou < min_iou_to_match:
+            status[cur_idx] = "updated"
+        else:
+            status[cur_idx] = "not_updated"
+    return status, cur_to_prev
+
+
+def draw_seg_overlay(color_bgr, masks, labels, conf):
+    out = color_bgr.copy()
+    if masks.shape[0] == 0:
+        return out
+
+    rng = np.random.default_rng(123)
+    colors = rng.integers(low=0, high=255, size=(masks.shape[0], 3), dtype=np.uint8)
+    for i in range(masks.shape[0]):
+        m = masks[i] > 0.5
+        if not np.any(m):
+            continue
+        color = tuple(int(c) for c in colors[i])
+        out[m] = (0.65 * out[m] + 0.35 * np.array(color, dtype=np.float32)).astype(np.uint8)
+
+        ys, xs = np.where(m)
+        if ys.size == 0:
+            continue
+        x0, y0 = int(xs.min()), int(ys.min())
+        x1, y1 = int(xs.max()), int(ys.max())
+        cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
+
+        label = labels[i] if i < len(labels) else f"obj_{i}"
+        score = float(conf[i]) if i < len(conf) else 0.0
+        cv2.putText(
+            out,
+            f"{label}:{score:.2f}",
+            (x0, max(20, y0 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+def to_uint8(img):
+    if img.dtype == np.uint8:
+        return img
+    if img.max() <= 1.1:
+        return (img * 255.0).clip(0, 255).astype(np.uint8)
+    return img.clip(0, 255).astype(np.uint8)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="RealSense + RF-DETR + FoundationPose demo")
+    parser.add_argument("--checkpoint", type=str, default=os.environ.get("RFDETR_CHECKPOINT"), help="RF-DETR checkpoint path")
+    parser.add_argument("--threshold", type=float, default=float(os.environ.get("RFDETR_THRESHOLD", "0.7")), help="RF-DETR confidence threshold")
+    parser.add_argument("--target-label", type=str, default=os.environ.get("RFDETR_TARGET_LABEL", "all"), help="Instance label to track ('all' for every instance)")
+    parser.add_argument("--blur-ksize", type=int, default=int(os.environ.get("RFDETR_BLUR_KSIZE", "5")), help="Gaussian blur kernel size for RF-DETR input")
+    parser.add_argument("--max-frames", type=int, default=int(os.environ.get("DEMO_MAX_FRAMES", "0")), help="Stop after N frames; 0 means infinite")
+    parser.add_argument("--device", type=str, default=os.environ.get("RFDETR_DEVICE", "cuda"), help="RF-DETR device")
+    parser.add_argument("--center-thresh-px", type=float, default=float(os.environ.get("INSTANCE_CENTER_THRESH_PX", "15.0")), help="2D center movement threshold")
+    parser.add_argument("--depth-thresh-mm", type=float, default=float(os.environ.get("INSTANCE_DEPTH_THRESH_MM", "5.0")), help="mean depth change threshold")
+    parser.add_argument("--iou-thresh", type=float, default=float(os.environ.get("INSTANCE_IOU_THRESH", "0.05")), help="IoU threshold for instance matching")
+    parser.add_argument("--match-max-center-px", type=float, default=float(os.environ.get("INSTANCE_MATCH_MAX_CENTER_PX", "120.0")), help="max center distance allowed for current->prev mapping")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    print("[demo] started", flush=True)
+
+    script_dir = Path(__file__).resolve().parent
+    results_dir = Path(os.environ.get("FRAME_OUTPUT_DIR", str(script_dir / "demo_data" / "mustard0" / "results")))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[demo] Writing rendered frames to: {results_dir}", flush=True)
+
+    remy_perception_dir = Path(os.environ.get("REMY_PERCEPTION_DIR", "/workspace/remy-pose-estimation/src/perception"))
+    default_mesh = remy_perception_dir / "mesh" / "switch_obj_scaled" / "switch_scaled.obj"
+    mesh_file = Path(os.environ.get("FOUNDATIONPOSE_MESH_FILE", str(default_mesh)))
+    if not mesh_file.exists():
+        raise FileNotFoundError(f"Switch mesh not found: {mesh_file}")
+
+    class_map = parse_class_map(os.environ.get("RFDETR_CLASS_ID_TO_LABEL_JSON"))
+
+    fp_cfg = FoundationPoseWrapperConfig(
+        downsample_width=int(os.environ.get("FOUNDATIONPOSE_DOWNSAMPLE_WIDTH", "256")),
+        est_refine_iter=int(os.environ.get("FOUNDATIONPOSE_EST_REFINE_ITER", "0")),
+        track_refine_iter=int(os.environ.get("FOUNDATIONPOSE_TRACK_REFINE_ITER", "1")),
+        chunk_size=int(os.environ.get("FOUNDATIONPOSE_CHUNK_SIZE", "32")),
+    )
+    fp_wrapper = FoundationPoseWrapper(cfg=fp_cfg)
+    mesh = FoundationPoseWrapper.load_mesh(str(mesh_file))
+
+    print(f"[demo] Loading RF-DETR (device={args.device}, checkpoint={args.checkpoint})", flush=True)
+    seg_model = load_rfdetr_model(args.checkpoint, device=args.device)
+    if hasattr(seg_model, "optimize_for_inference"):
+        seg_model.optimize_for_inference()
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    profile = pipeline.start(config)
+    align = rs.align(rs.stream.color)
+    depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
+
+    print(f"[demo] depth_scale={depth_scale}", flush=True)
+
+    show_viz = os.environ.get("FP_SHOW_VIZ", "0") == "1"
+    ui_available = False
+    if show_viz:
+        try:
+            cv2.namedWindow("segmentation", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("foundationpose", cv2.WINDOW_NORMAL)
+            ui_available = True
+        except cv2.error as exc:
+            print(f"[demo] HighGUI unavailable, running headless: {exc}", flush=True)
+
+    initialized = False
+    tracked_object_names = []
+    prev_instances = []
+    frame_idx = 0
+    label_filter = None if str(args.target_label).strip().lower() == "all" else str(args.target_label).strip()
+
+    try:
+        while True:
+            frames = pipeline.wait_for_frames()
+            aligned = align.process(frames)
+            color_frame = aligned.get_color_frame()
+            depth_frame = aligned.get_depth_frame()
+            if not color_frame or not depth_frame:
+                continue
+
+            if frame_idx == 0:
+                intrinsics = intrinsics_matrix_from_color_frame(color_frame)
+                fp_wrapper.set_camera_intrinsics(intrinsics)
+                print(f"[demo] camera intrinsics set:\n{intrinsics}", flush=True)
+
+            color_bgr = np.asanyarray(color_frame.get_data())
+            depth_raw = np.asanyarray(depth_frame.get_data())
+            depth_m = depth_raw.astype(np.float32) * depth_scale
+            color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+
+            blur_ksize = max(1, int(args.blur_ksize))
+            if blur_ksize % 2 == 0:
+                blur_ksize += 1
+            infer_bgr = cv2.GaussianBlur(color_bgr, (blur_ksize, blur_ksize), 0) if blur_ksize > 1 else color_bgr
+            infer_rgb = cv2.cvtColor(infer_bgr, cv2.COLOR_BGR2RGB)
+
+            frame_t0 = time.perf_counter()
+            seg_t0 = time.perf_counter()
+            detections = seg_model.predict(infer_rgb, threshold=float(args.threshold))
+            seg_ms = (time.perf_counter() - seg_t0) * 1000.0
+
+            h, w = color_bgr.shape[:2]
+            masks = detections_masks_to_numpy(detections, h, w)
+            instances, labels, conf = collect_instances(detections, masks, class_map, label_filter=label_filter)
+
+            track_ms = 0.0
+            reg_ms = 0.0
+            n_updated = 0
+            n_not_updated = 0
+            if not initialized and instances:
+                fp_wrapper.reset_scene(color_rgb, depth_m)
+                tracked_object_names = []
+                for i, inst in enumerate(instances):
+                    obj_name = f"{inst['label']}_{i}"
+                    fp_wrapper.add_object(obj_name, mesh, inst["mask"].astype(bool))
+                    tracked_object_names.append(obj_name)
+                initialized = len(tracked_object_names) > 0
+                if initialized:
+                    print(f"[demo] initialized FoundationPose for {len(tracked_object_names)} instance(s)", flush=True)
+                    prev_instances = summarize_instances(instances, depth_raw.astype(np.float32))
+                    for s in prev_instances:
+                        idx = int(s["cur_list_idx"])
+                        if idx < len(tracked_object_names):
+                            s["track_name"] = tracked_object_names[idx]
+
+            render = color_bgr
+            if initialized:
+                track_t0 = time.perf_counter()
+                _ = fp_wrapper.step_scene(color_rgb, depth_m)
+                track_ms = (time.perf_counter() - track_t0) * 1000.0
+
+                if instances:
+                    cur_instances = summarize_instances(instances, depth_raw.astype(np.float32))
+                    instance_update_status, cur_to_prev = compute_instance_update_status(
+                        cur_instances,
+                        prev_instances,
+                        center_displacement_threshold_px=float(args.center_thresh_px),
+                        depth_change_threshold_mm=float(args.depth_thresh_mm),
+                        min_iou_to_match=float(args.iou_thresh),
+                        max_match_center_distance_px=float(args.match_max_center_px),
+                    )
+                    n_updated = sum(1 for v in instance_update_status.values() if v == "updated")
+                    n_not_updated = sum(1 for v in instance_update_status.values() if v == "not_updated")
+
+                    prev_idx_to_track = {
+                        int(p["cur_list_idx"]): str(p["track_name"])
+                        for p in prev_instances
+                        if "track_name" in p
+                    }
+                    active_track_names = set()
+                    next_prev_instances = []
+
+                    reg_t0 = time.perf_counter()
+                    for cur in cur_instances:
+                        cur_idx = int(cur["cur_list_idx"])
+                        inst = instances[cur_idx]
+                        track_name = None
+                        if cur_idx in cur_to_prev:
+                            prev_idx = int(cur_to_prev[cur_idx])
+                            track_name = prev_idx_to_track.get(prev_idx)
+
+                        if track_name and track_name in fp_wrapper.objects:
+                            if instance_update_status.get(cur_idx, "updated") == "updated":
+                                fp_wrapper.objects[track_name]["mask"] = np.asarray(inst["mask"], dtype=bool)
+                                fp_wrapper.register_object(track_name)
+                            cur["track_name"] = track_name
+                        else:
+                            track_name = f"{inst['label']}_{frame_idx}_{cur_idx}"
+                            fp_wrapper.add_object(track_name, mesh, np.asarray(inst["mask"], dtype=bool))
+                            cur["track_name"] = track_name
+                        active_track_names.add(track_name)
+                        next_prev_instances.append(cur)
+                    reg_ms = (time.perf_counter() - reg_t0) * 1000.0
+
+                    stale = [name for name in list(fp_wrapper.objects.keys()) if name not in active_track_names]
+                    for name in stale:
+                        del fp_wrapper.objects[name]
+                    tracked_object_names = sorted(list(fp_wrapper.objects.keys()))
+                    prev_instances = next_prev_instances
+
+                render_raw = fp_wrapper.render_results()
+                render = to_uint8(render_raw)
+                if render.ndim == 3 and render.shape[2] == 3:
+                    render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
+
+            seg_overlay = draw_seg_overlay(color_bgr, masks, labels, conf)
+            total_ms = (time.perf_counter() - frame_t0) * 1000.0
+            fps = (1000.0 / total_ms) if total_ms > 0 else 0.0
+            status = f"FPS:{fps:.1f}  det:{len(instances)}  tracked:{len(tracked_object_names)}"
+            cv2.putText(seg_overlay, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                seg_overlay,
+                f"updated:{n_updated} not_updated:{n_not_updated}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            render_path = results_dir / f"rendered.png"
+            seg_path = results_dir / f"segmentation.png"
+            rgb_path = results_dir / f"rgb.png"
+            depth_path = results_dir / f"depth.png"
+
+            cv2.imwrite(str(render_path), render)
+            cv2.imwrite(str(seg_path), seg_overlay)
+            cv2.imwrite(str(rgb_path), color_bgr)
+            cv2.imwrite(str(depth_path), depth_raw)
+
+            if frame_idx % 1 == 0:
+                print(
+                    f"[timing] frame={frame_idx} seg_ms={seg_ms:.1f} track_ms={track_ms:.1f} reg_ms={reg_ms:.1f} total_ms={total_ms:.1f} fps={fps:.1f} det={len(instances)} tracked={len(tracked_object_names)} updated={n_updated} not_updated={n_not_updated}",
+                    flush=True,
+                )
+
+            if ui_available:
+                try:
+                    cv2.imshow("segmentation", seg_overlay)
+                    cv2.imshow("foundationpose", render)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        break
+                    if key == ord("r"):
+                        initialized = False
+                        prev_instances = []
+                        print("[demo] tracking reset requested", flush=True)
+                except cv2.error as exc:
+                    print(f"[demo] HighGUI failed, disabling windows: {exc}", flush=True)
+                    ui_available = False
+
+            frame_idx += 1
+            if args.max_frames > 0 and frame_idx >= args.max_frames:
+                break
+
+    finally:
+        pipeline.stop()
+        if ui_available:
+            cv2.destroyAllWindows()
+
+    print(f"[demo] finished. saved_frames={frame_idx}", flush=True)
 
 
 if __name__ == "__main__":
-    import threading
-    gpu_util_samples = []
-    gpu_mem_samples = []
-    _stop_event = threading.Event()
-    _monitor_thread = threading.Thread(
-        target=_gpu_monitor_worker,
-        args=(gpu_util_samples, gpu_mem_samples, _stop_event),
-        daemon=True,
-    )
-    _monitor_thread.start()
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    test_scene_dir = os.path.join(script_dir, "demo_data", "mustard0")
-
-    # Download test data
-    if not os.path.exists(test_scene_dir):
-        import zipfile
-        import gdown
-
-        file_id = "1AwV9sESDKMgXGUu2n1o0Pc4x2JGYdVB3"
-        zip_path = os.path.join(script_dir, "demo_data.zip")
-        print("demo_data/mustard0 not found, downloading demo data...")
-        try:
-            gdown.download(id=file_id, output=zip_path, quiet=False)
-        except Exception as e:
-            print(f"Error downloading demo data: {e}")
-            print(f"Please download the demo data manually from https://drive.google.com/file/d/{file_id}/view?usp=sharing and extract it to demo/demo_data/")
-            exit()
-        print("Extracting demo data...")
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(script_dir)
-        os.remove(zip_path)
-        print("Done.")
-
-    test_scene_dir = test_scene_dir + "/"
-    mesh_file = test_scene_dir + "mesh/textured_simple.obj"
-    obj_name = "mustard0"
-
-    # Initialize wrapper
-    cfg = FoundationPoseWrapperConfig(
-        downsample_width=256,  # Probably leave None for best accuracy, or set to, e.g., 256 for faster prediction
-        est_refine_iter=0,  # Increase if the initial pose is not good enough
-        track_refine_iter=1,  # Increase if the tracking is not good enough
-        chunk_size=32,  # Specify which chunk size to use for the TensorRT engines (must match the value used in convert_onnx.sh when generating the engines
-    )
-    fp_wrapper = FoundationPoseWrapper(cfg=cfg)
-
-    reader = YcbineoatReader(video_dir=test_scene_dir, shorter_side=None, zfar=np.inf)  # type: ignore
-
-    # Set camera intrinsics
-    camera_intrinsics = reader.K
-    fp_wrapper.set_camera_intrinsics(camera_intrinsics)
-
-    # Load mesh
-    mesh = FoundationPoseWrapper.load_mesh(mesh_file)
-
-    step_scene_times = []
-    estimation_times = []
-
-    for i in range(len(reader.color_files)):
-        # Get images from dataset
-        color = reader.get_color(i)
-        depth = reader.get_depth(i)
-
-        if i == 0:
-            mask = reader.get_mask(0).astype(bool)
-
-            # Reset to new scene
-            fp_wrapper.reset_scene(color, depth)
-
-            # Add objects to be detected and tracked (triggers initial pose estimation)
-            poses = {}
-            poses[obj_name] = fp_wrapper.add_object(obj_name, mesh, mask)
-
-            # Do a bunch of pose estimation steps just for benchmarking (add_object might contain additional time-intensive program logic)
-            for i in range(10):
-                print("Re-running initial estimation for benchmarking...")
-                start_time = time.perf_counter()
-                poses[obj_name] = fp_wrapper.register_object(obj_name)
-                end_time = time.perf_counter()
-                print(f"Estimation time: {(end_time - start_time) * 1000:.2f} ms")
-                estimation_times.append(end_time - start_time)
-
-        else:
-            # Step to next frame (triggers pose tracking)
-            start_time = time.perf_counter()
-            poses = fp_wrapper.step_scene(color, depth)
-            end_time = time.perf_counter()
-            step_scene_times.append(end_time - start_time)
-
-        print(f"Frame {i}, estimated poses: {poses}")
-
-        res = fp_wrapper.render_results()
-        cv2.imwrite(f"results/rendered_{i}.png", res)
-        # cv2.imshow("rendered", res)
-        # cv2.waitKey(1)
-
-    _stop_event.set()
-    _monitor_thread.join()
-
-    if estimation_times:
-        mean_estimation_time = sum(estimation_times) / len(estimation_times)
-        print(f"Mean time for initial estimation: {mean_estimation_time * 1000:.2f} ms")
-
-    if step_scene_times:
-        mean_step_scene_time = sum(step_scene_times) / len(step_scene_times)
-        print(f"Mean time for step_scene: {mean_step_scene_time * 1000:.2f} ms")
-
-    if gpu_util_samples:
-        print(f"GPU utilization  — avg: {sum(gpu_util_samples)/len(gpu_util_samples):.1f}%  max: {max(gpu_util_samples):.1f}%")
-    if gpu_mem_samples:
-        print(f"GPU memory (MiB) — avg: {sum(gpu_mem_samples)/len(gpu_mem_samples):.0f}  max: {max(gpu_mem_samples):.0f}")
+    main()

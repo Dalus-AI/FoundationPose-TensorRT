@@ -159,16 +159,17 @@ class FoundationposeModel:
     def guess_translation(self, depth, mask, K):
         vs, us = np.where(mask > 0)
         if len(us) == 0:
-            return np.zeros((3))
-        uc = (us.min() + us.max()) / 2.0
-        vc = (vs.min() + vs.max()) / 2.0
+            return np.zeros(3, dtype=np.float32)
+        uc = float((us.min() + us.max()) / 2.0)
+        vc = float((vs.min() + vs.max()) / 2.0)
         valid = mask.astype(bool) & (depth >= 0.1)
         if not valid.any():
-            return np.zeros((3))
+            return np.zeros(3, dtype=np.float32)
 
-        zc = np.median(depth[valid])
-        center = (np.linalg.inv(K) @ np.asarray([uc, vc, 1]).reshape(3, 1)) * zc
-        return center.reshape(3)
+        zc = float(np.median(depth[valid]))
+        K_f32 = np.asarray(K, dtype=np.float32)
+        center = (np.linalg.inv(K_f32) @ np.array([uc, vc, 1.0], dtype=np.float32).reshape(3, 1)) * zc
+        return center.reshape(3).astype(np.float32)
 
     def generate_random_pose_hypo(self, K, depth, mask, device):
         """
@@ -181,19 +182,20 @@ class FoundationposeModel:
         ).reshape(1, 3)
         return ob_in_cams
 
-    def preprocess(self, mesh, intrinsics):
+    def preprocess(self, mesh, intrinsics, min_n_views=40, inplane_step=60):
         self.mesh = mesh
-        self.to_origin, extents = trimesh.bounds.oriented_bounds(self.mesh)
-        self.extent_bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
+        to_origin, extents = trimesh.bounds.oriented_bounds(self.mesh)
+        self.to_origin = np.asarray(to_origin, dtype=np.float32)
+        self.extent_bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3).astype(np.float32)
         self.mesh_reset, self.mesh_tensor, self.diameter, self.model_center = (
             postprocessor.reset_object(
-                model_pts=self.mesh.vertices,
-                model_normals=self.mesh.vertex_normals,
+                model_pts=np.asarray(self.mesh.vertices, dtype=np.float32),
+                model_normals=np.asarray(self.mesh.vertex_normals, dtype=np.float32),
                 mesh=self.mesh,
             )
         )
-        self.K = intrinsics
-        self.make_rotation_grid(min_n_views=40, inplane_step=60)
+        self.K = np.asarray(intrinsics, dtype=np.float32)
+        self.make_rotation_grid(min_n_views=min_n_views, inplane_step=inplane_step)
         self.tracking_pose = None
 
     def refiner_predict(
@@ -358,6 +360,8 @@ class FoundationposeModel:
         return scores
 
     def register(self, rgb, depth, ob_mask, mesh, iteration=2, device="cuda"):
+        if isinstance(depth, np.ndarray):
+            depth = depth.astype(np.float32)
         depth = postprocessor.bilateral_filter_depth(depth, radius=2, device=device)
 
         normal_map = None

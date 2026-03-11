@@ -197,7 +197,12 @@ def make_mesh_tensors(mesh, device="cuda"):
     Build the mesh in torch.tensor
     """
     mesh_tensors = {}
-    if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
+    has_texture = (
+        isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals)
+        and getattr(mesh.visual, "material", None) is not None
+        and getattr(mesh.visual.material, "image", None) is not None
+    )
+    if has_texture:
         img = np.array(mesh.visual.material.image.convert("RGB"))
         img = img[..., :3]
         mesh_tensors["tex"] = (
@@ -295,13 +300,16 @@ def compute_crop_window_tf_batch(
     """
     B = len(poses)
     torch.set_default_tensor_type("torch.cuda.FloatTensor")
+    if mesh_diameter is not None:
+        mesh_diameter = float(mesh_diameter)
     if method == "box_3d":
         radius = mesh_diameter * crop_ratio / 2
         offsets = torch.tensor(
-            [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0]
+            [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0],
+            dtype=torch.float32,
         ).reshape(-1, 3)
         pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
-        K = torch.as_tensor(K)
+        K = torch.as_tensor(K, dtype=torch.float32)
         projected = (K @ pts.reshape(-1, 3).T).T
         uvs = projected[:, :2] / projected[:, 2:3]
         uvs = uvs.reshape(B, -1, 2)
